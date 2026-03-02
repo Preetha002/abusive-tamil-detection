@@ -1,0 +1,20 @@
+# datasets
+data/
+
+# models
+model/
+model_best/
+model_run*/
+
+# submissions
+*.csv
+*.zip
+
+# logs
+training_log*.txt
+training_log_run*.txt
+
+# python
+__pycache__/
+*.pyc
+venv/
