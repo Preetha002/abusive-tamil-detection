@@ -1,85 +1,62 @@
-print("train.py started")
-
+import os
+import random
+import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import Dataset, DataLoader
-from transformers import XLMRobertaTokenizer, XLMRobertaForSequenceClassification
+from transformers import (
+    XLMRobertaTokenizer,
+    XLMRobertaForSequenceClassification,
+    get_cosine_schedule_with_warmup
+)
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import f1_score
-from tqdm import tqdm
-import numpy as np
-from sklearn.utils.class_weight import compute_class_weight
+from tqdm.auto import tqdm
 
-
-# -------- SETTINGS --------
+# ================= SETTINGS =================
+SEED = 42
 MODEL_NAME = "xlm-roberta-base"
-MAX_LEN = 128
-BATCH_SIZE = 16          # smaller for CPU
-EPOCHS = 5
-LR = 2e-5
+MAX_LEN = 256
+BATCH_SIZE = 16
+EPOCHS = 10
+LR = 1e-5
+WEIGHT_DECAY = 0.01
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# -------- LOAD DATA --------
-df = pd.read_csv("data/train.csv")
-print("Dataset loaded:", df.shape)
+print("Device:", DEVICE)
 
-# IMPORTANT: check column names
-print("Columns:", df.columns)
+# ================= SEED =================
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
 
-# Adjust column names if needed
-TEXT_COL = "Text"
-LABEL_COL = "Class"
+# ================= LOAD DATA =================
+df = pd.read_csv("train.csv")
 
-# -------- ROBUST LABEL ENCODING (handles spaces, hyphens, casing) --------
-raw = df[LABEL_COL].astype(str)
-
-# normalize:
-# 1) lowercase
-# 2) strip leading/trailing spaces
-# 3) remove all spaces
-# 4) remove hyphens
+raw = df["Class"].astype(str)
 norm = (
     raw.str.lower()
-       .str.strip()
-       .str.replace(" ", "", regex=False)
-       .str.replace("-", "", regex=False)
+    .str.strip()
+    .str.replace(" ", "", regex=False)
+    .str.replace("-", "", regex=False)
 )
 
-print("Unique raw labels:", sorted(raw.unique()))
-print("Unique normalized labels:", sorted(norm.unique()))
-
-label_map = {
-    "nonabusive": 0,
-    "abusive": 1
-}
-
+label_map = {"nonabusive": 0, "abusive": 1}
 df["label_id"] = norm.map(label_map)
-
-# Drop any rows with unmapped/unknown labels (prevents NaN crash)
-before = len(df)
 df = df.dropna(subset=["label_id"]).copy()
 df["label_id"] = df["label_id"].astype(int)
 
-classes = np.array([0, 1])
-weights = compute_class_weight(class_weight="balanced", classes=classes, y=df["label_id"].values)
-class_weights = torch.tensor(weights, dtype=torch.float).to(DEVICE)
-print("Class weights:", class_weights)
-loss_fn = torch.nn.CrossEntropyLoss(weight=class_weights)
-
-after = len(df)
-
-print(f"Label mapping done. Dropped {before-after} bad rows. Remaining: {after}")
-
-# -------- TRAIN-VALIDATION SPLIT --------
 train_texts, val_texts, train_labels, val_labels = train_test_split(
-    df[TEXT_COL].astype(str).tolist(),
+    df["Text"].astype(str).tolist(),
     df["label_id"].tolist(),
     test_size=0.2,
-    random_state=42,
-    stratify=df["label_id"].tolist()
+    random_state=SEED,
+    stratify=df["label_id"]
 )
 
-# -------- DATASET CLASS --------
+# ================= DATASET =================
 class TamilDataset(Dataset):
     def __init__(self, texts, labels, tokenizer):
         self.texts = texts
@@ -90,43 +67,58 @@ class TamilDataset(Dataset):
         return len(self.texts)
 
     def __getitem__(self, idx):
-        encoding = self.tokenizer(
+        enc = self.tokenizer(
             self.texts[idx],
             truncation=True,
             padding="max_length",
             max_length=MAX_LEN,
-            return_tensors="pt"
+            return_tensors="pt",
         )
         return {
-            "input_ids": encoding["input_ids"].squeeze(),
-            "attention_mask": encoding["attention_mask"].squeeze(),
-            "labels": torch.tensor(self.labels[idx], dtype=torch.long)
+            "input_ids": enc["input_ids"].squeeze(0),
+            "attention_mask": enc["attention_mask"].squeeze(0),
+            "labels": torch.tensor(self.labels[idx], dtype=torch.long),
         }
 
-# -------- TOKENIZER & MODEL --------
+# ================= MODEL =================
 tokenizer = XLMRobertaTokenizer.from_pretrained(MODEL_NAME)
 model = XLMRobertaForSequenceClassification.from_pretrained(
-    MODEL_NAME,
-    num_labels=2
+    MODEL_NAME, num_labels=2
+).to(DEVICE)
+
+train_loader = DataLoader(
+    TamilDataset(train_texts, train_labels, tokenizer),
+    batch_size=BATCH_SIZE,
+    shuffle=True,
 )
-model.to(DEVICE)
 
-train_dataset = TamilDataset(train_texts, train_labels, tokenizer)
-val_dataset = TamilDataset(val_texts, val_labels, tokenizer)
+val_loader = DataLoader(
+    TamilDataset(val_texts, val_labels, tokenizer),
+    batch_size=BATCH_SIZE,
+)
 
-train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE)
+optimizer = torch.optim.AdamW(
+    model.parameters(),
+    lr=LR,
+    weight_decay=WEIGHT_DECAY,
+)
 
-optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
+total_steps = len(train_loader) * EPOCHS
+scheduler = get_cosine_schedule_with_warmup(
+    optimizer,
+    num_warmup_steps=int(0.1 * total_steps),
+    num_training_steps=total_steps,
+)
+
+# ================= TRAIN LOOP =================
 best_f1 = 0.0
+os.makedirs("model_run3", exist_ok=True)
 
-# -------- TRAINING LOOP --------
 for epoch in range(EPOCHS):
-    print(f"\n Epoch {epoch+1}/{EPOCHS}")
     model.train()
     total_loss = 0
 
-    for batch in tqdm(train_loader):
+    for batch in tqdm(train_loader, desc=f"Epoch {epoch+1}/{EPOCHS} - train"):
         optimizer.zero_grad()
 
         input_ids = batch["input_ids"].to(DEVICE)
@@ -134,44 +126,47 @@ for epoch in range(EPOCHS):
         labels = batch["labels"].to(DEVICE)
 
         outputs = model(
-        input_ids=input_ids,
-         attention_mask=attention_mask
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            labels=labels,
         )
 
-        loss = loss_fn(outputs.logits, labels)
-
+        loss = outputs.loss
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+
         optimizer.step()
+        scheduler.step()
 
         total_loss += loss.item()
 
-    avg_loss = total_loss / len(train_loader)
-    print(f"Training Loss: {avg_loss:.4f}")
+    print(f"Train loss: {total_loss/len(train_loader):.4f}")
 
-    # -------- VALIDATION --------
+    # ===== VALIDATION =====
     model.eval()
-    preds, true = [], []
+    preds, gold = [], []
 
     with torch.no_grad():
         for batch in val_loader:
             input_ids = batch["input_ids"].to(DEVICE)
             attention_mask = batch["attention_mask"].to(DEVICE)
 
-            outputs = model(
+            logits = model(
                 input_ids=input_ids,
-                attention_mask=attention_mask
-            )
+                attention_mask=attention_mask,
+            ).logits
 
-            predictions = torch.argmax(outputs.logits, dim=1)
-            preds.extend(predictions.cpu().numpy())
-            true.extend(batch["labels"].numpy())
+            pred = torch.argmax(logits, dim=1).cpu().numpy().tolist()
+            preds.extend(pred)
+            gold.extend(batch["labels"].numpy().tolist())
 
-    f1 = f1_score(true, preds, average="macro")
-    print(f"Validation Macro F1: {f1:.4f}")
+    f1 = f1_score(gold, preds, average="macro")
+    print("Validation Macro F1:", f1)
 
-# -------- SAVE MODEL --------
-if f1 > best_f1:
-    best_f1 = f1
-    model.save_pretrained("model_best")
-    tokenizer.save_pretrained("model_best")
-    print(f"Saved BEST model (Macro F1={best_f1:.4f}) to ./model_best/")
+    if f1 > best_f1:
+        best_f1 = f1
+        model.save_pretrained("model")
+        tokenizer.save_pretrained("model")
+        print("Saved BEST model")
+
+print("🔥 Best F1:", best_f1)
